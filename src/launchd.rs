@@ -17,26 +17,87 @@ static LAUNCHCTL: &str = "launchctl";
 const PLIST_FILE_PERMISSIONS: u32 = 0o644;
 
 /// Configuration settings tied to launchd services
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchdConfig {
     pub install: LaunchdInstallConfig,
 }
 
 /// Configuration settings tied to launchd services during installation
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct LaunchdInstallConfig {
-    /// If true, will include `KeepAlive` flag set to true
-    pub keep_alive: bool,
+    /// Keep the service alive.
+    pub keep_alive: KeepAlive,
 }
 
-impl Default for LaunchdInstallConfig {
+/// Represents the value of the `KeepAlive` key in a launchd plist.
+/// This can be a simple boolean or a dictionary of conditions.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeepAlive {
+    /// A simple boolean value. `true` means always keep alive, `false` means never.
+    Bool(bool),
+    /// A dictionary of conditions that determine whether to keep the job alive.
+    Dict(Dictionary),
+}
+
+impl KeepAlive {
+    /// Keep the job alive, always. Equivalent to `KeepAlive::Bool(true)`.
+    pub fn always() -> Self {
+        Self::Bool(true)
+    }
+
+    /// Creates a new dictionary-based KeepAlive configuration to which conditions can be added.
+    pub fn conditions() -> Self {
+        Self::Dict(Dictionary::new())
+    }
+
+    /// Adds the `SuccessfulExit` condition. If `true`, the job will be kept alive
+    /// as long as it exits with a status of 0. If `false`, it will be kept alive
+    /// if it exits with a non-zero status.
+    ///
+    /// This will convert the `KeepAlive` to the `Dict` variant if it is currently `Bool`.
+    pub fn successful_exit(mut self, value: bool) -> Self {
+        self.as_dict_mut()
+            .insert("SuccessfulExit".to_string(), Value::Boolean(value));
+        self
+    }
+
+    /// Adds the `Crashed` condition. If `true`, the job will be kept alive if it crashes.
+    /// If `false`, it will not be kept alive if it crashes.
+    ///
+    /// This will convert the `KeepAlive` to the `Dict` variant if it is currently `Bool`.
+    pub fn crashed(mut self, value: bool) -> Self {
+        self.as_dict_mut()
+            .insert("Crashed".to_string(), Value::Boolean(value));
+        self
+    }
+
+    /// Helper to get or create the dictionary.
+    /// If `self` is `Bool`, it will be replaced with an empty `Dict`.
+    fn as_dict_mut(&mut self) -> &mut Dictionary {
+        if let KeepAlive::Bool(_) = self {
+            *self = KeepAlive::Dict(Dictionary::new());
+        }
+        match self {
+            KeepAlive::Dict(dict) => dict,
+            KeepAlive::Bool(_) => unreachable!(),
+        }
+    }
+}
+
+impl Default for KeepAlive {
     fn default() -> Self {
-        Self { keep_alive: true }
+        Self::Bool(true)
+    }
+}
+
+impl From<bool> for KeepAlive {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
     }
 }
 
 /// Implementation of [`ServiceManager`] for MacOS's [Launchd](https://en.wikipedia.org/wiki/Launchd)
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchdServiceManager {
     /// Whether or not this manager is operating at the user-level
     pub user: bool,
@@ -89,6 +150,50 @@ impl LaunchdServiceManager {
 
         dir_path.join(format!("{}.plist", qualified_name))
     }
+
+    fn launchctl(&self, cmd: &str, label: &str) -> io::Result<Output> {
+        let mut command = Command::new(LAUNCHCTL);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let use_modern = is_modern_available() && !self.user;
+
+        let modern_cmd = if use_modern {
+            match cmd {
+                "load" => "bootstrap",
+                "remove" => "bootout",
+                "start" => "kickstart",
+                "stop" => "kill",
+                _ => cmd,
+            }
+        } else {
+            cmd
+        };
+
+        let domain_target = "system";
+        command.arg(modern_cmd);
+        match modern_cmd {
+            "bootstrap" => {
+                command.arg(domain_target).arg(label);
+            }
+            "bootout" | "kickstart" => {
+                let service_target = format!("{}/{}", domain_target, label);
+                command.arg(service_target);
+            }
+            "kill" => {
+                let signal = "SIGTERM";
+                let service_target = format!("{}/{}", domain_target, label);
+                command.arg(signal).arg(service_target);
+            }
+            _ => {
+                command.arg(label);
+            }
+        }
+
+        command.output()
+    }
 }
 
 impl ServiceManager for LaunchdServiceManager {
@@ -96,7 +201,7 @@ impl ServiceManager for LaunchdServiceManager {
         match which::which(LAUNCHCTL) {
             Ok(_) => Ok(true),
             Err(which::Error::CannotFindBinaryPath) => Ok(false),
-            Err(x) => Err(io::Error::new(io::ErrorKind::Other, x)),
+            Err(x) => Err(io::Error::other(x)),
         }
     }
 
@@ -121,13 +226,15 @@ impl ServiceManager for LaunchdServiceManager {
                 ctx.working_directory.clone(),
                 ctx.environment.clone(),
                 ctx.autostart,
-                ctx.disable_restart_on_failure
+                ctx.disable_restart_on_failure,
             ),
         };
 
         // Unload old service first if it exists
         if plist_path.exists() {
-            let _ = wrap_output(launchctl("remove", ctx.label.to_qualified_name().as_str())?);
+            let _ = self.uninstall(ServiceUninstallCtx {
+                label: ctx.label.clone(),
+            });
         }
 
         utils::write_file(
@@ -138,22 +245,25 @@ impl ServiceManager for LaunchdServiceManager {
 
         // Load the service.
         // If "KeepAlive" is set to true, the service will immediately start.
-        wrap_output(launchctl("load", plist_path.to_string_lossy().as_ref())?)?;
+        wrap_output(self.launchctl("load", &plist_path.to_string_lossy())?)?;
 
         Ok(())
     }
 
     fn uninstall(&self, ctx: ServiceUninstallCtx) -> io::Result<()> {
-        let plist_path = self.get_plist_path(ctx.label.to_qualified_name());
+        let qualified_name = ctx.label.to_qualified_name();
+        let plist_path = self.get_plist_path(qualified_name.clone());
+
         // Service might already be removed (if it has "KeepAlive")
-        let _ = wrap_output(launchctl("remove", ctx.label.to_qualified_name().as_str())?);
+        let _ = wrap_output(self.launchctl("remove", &qualified_name)?);
+
         let _ = std::fs::remove_file(plist_path);
         Ok(())
     }
 
     fn start(&self, ctx: ServiceStartCtx) -> io::Result<()> {
         // To start services that do not have "KeepAlive" set to true
-        wrap_output(launchctl("start", ctx.label.to_qualified_name().as_str())?)?;
+        wrap_output(self.launchctl("start", ctx.label.to_qualified_name().as_str())?)?;
         Ok(())
     }
 
@@ -161,7 +271,7 @@ impl ServiceManager for LaunchdServiceManager {
     ///
     /// To stop a service with "KeepAlive" enabled, call `uninstall` instead.
     fn stop(&self, ctx: ServiceStopCtx) -> io::Result<()> {
-        wrap_output(launchctl("stop", ctx.label.to_qualified_name().as_str())?)?;
+        wrap_output(self.launchctl("stop", ctx.label.to_qualified_name().as_str())?)?;
         Ok(())
     }
 
@@ -189,7 +299,7 @@ impl ServiceManager for LaunchdServiceManager {
         // Or it will return nothing, it means the service is not installed(not exists).
         let mut out: Cow<str> = Cow::Borrowed("");
         for i in 0..2 {
-            let output = launchctl("print", &service_name)?;
+            let output = self.launchctl("print", &service_name)?;
             if !output.status.success() {
                 if output.status.code() == Some(64) {
                     // 64 is the exit code for a service not found
@@ -208,24 +318,18 @@ impl ServiceManager for LaunchdServiceManager {
                         }
                     } else {
                         // We have access to the full service label, so it impossible to get the failed status, or it must be input error.
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!(
-                                "Command failed with exit code {}: {}",
-                                output.status.code().unwrap_or(-1),
-                                out
-                            ),
-                        ));
-                    }
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
+                        return Err(io::Error::other(format!(
                             "Command failed with exit code {}: {}",
                             output.status.code().unwrap_or(-1),
-                            String::from_utf8_lossy(&output.stderr)
-                        ),
-                    ));
+                            out
+                        )));
+                    }
+                } else {
+                    return Err(io::Error::other(format!(
+                        "Command failed with exit code {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
                 }
             }
             out = Cow::Owned(String::from_utf8_lossy(&output.stdout).to_string());
@@ -246,14 +350,20 @@ impl ServiceManager for LaunchdServiceManager {
     }
 }
 
-fn launchctl(cmd: &str, label: &str) -> io::Result<Output> {
-    Command::new(LAUNCHCTL)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .arg(cmd)
-        .arg(label)
-        .output()
+fn is_modern_available() -> bool {
+    #[cfg(target_os = "macos")]
+    if let Ok(release) = sys_info::os_release() {
+        // os_release() returns something like "13.4.1"
+        if let Some(major_str) = release.split('.').next() {
+            if let Ok(major) = major_str.parse::<u32>() {
+                // bootstrap/bootout were introduced in macOS 10.10.
+                // Big Sur is 11. So anything >= 11 should be fine.
+                return major >= 11;
+            }
+        }
+    }
+    // Default to false if we can't determine the version
+    false
 }
 
 #[inline]
@@ -268,6 +378,7 @@ fn user_agent_dir_path() -> io::Result<PathBuf> {
         .join("LaunchAgents"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_plist<'a>(
     config: &LaunchdInstallConfig,
     label: &str,
@@ -291,7 +402,11 @@ fn make_plist<'a>(
     );
 
     if !disable_restart_on_failure {
-        dict.insert("KeepAlive".to_string(), Value::Boolean(config.keep_alive));
+        let keep_alive_value = match config.keep_alive.clone() {
+            KeepAlive::Bool(b) => Value::Boolean(b),
+            KeepAlive::Dict(d) => Value::Dictionary(d),
+        };
+        dict.insert("KeepAlive".to_string(), keep_alive_value);
     }
 
     if let Some(username) = username {

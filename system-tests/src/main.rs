@@ -185,7 +185,7 @@ impl Cli {
 
                 handle
                     .join()
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Thread join failed"))?
+                    .map_err(|_| io::Error::other("Thread join failed"))?
             }
         }
     }

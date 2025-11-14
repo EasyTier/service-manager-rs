@@ -133,7 +133,7 @@ let mut manager = LaunchdServiceManager::system();
 
 // Update an install configuration property where installing a service
 // will NOT add the KeepAlive flag
-manager.config.install.keep_alive = false;
+manager.config.install.keep_alive = service_manager::KeepAlive::Bool(false);
 
 // Install our service using the explicit service manager
 manager.install(ServiceInstallCtx {
