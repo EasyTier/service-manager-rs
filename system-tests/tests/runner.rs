@@ -1,4 +1,3 @@
-use assert_cmd::{crate_name, Command};
 use service_manager::*;
 use std::{
     ffi::OsString,
@@ -67,12 +66,12 @@ pub fn run_test(manager: &TypedServiceManager, username: Option<String>) -> Opti
     // Copy the service binary to a location where it can be accessed by a different user account
     // if need be.
     let temp_dir = std::env::temp_dir();
-    let bin_path = assert_cmd::cargo::cargo_bin(crate_name!());
+    let bin_path = assert_cmd::cargo::cargo_bin!();
     let temp_bin_path = temp_dir.join(bin_path.file_name().unwrap());
     if temp_bin_path.exists() {
         std::fs::remove_file(temp_bin_path.clone()).unwrap();
     }
-    std::fs::copy(&bin_path, &temp_bin_path).unwrap();
+    std::fs::copy(bin_path, &temp_bin_path).unwrap();
 
     // Ensure service manager is available
     eprintln!("Checking if service available");
@@ -168,22 +167,19 @@ pub fn run_test(manager: &TypedServiceManager, username: Option<String>) -> Opti
     wait();
 
     eprintln!("Checking status of service");
-    assert!(
-        matches!(
-            manager
-                .status(ServiceStatusCtx {
-                    label: service_label.clone(),
-                })
-                .unwrap(),
-            ServiceStatus::Running
-        ),
+    assert_eq!(
+        manager
+            .status(ServiceStatusCtx {
+                label: service_label.clone(),
+            })
+            .unwrap(),
+        ServiceStatus::Running,
         "service should be running"
     );
 
     // Communicate with the service
     eprintln!("Talking to service");
-    Command::cargo_bin(crate_name!())
-        .unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!()
         .arg("talk")
         .arg(addr.to_string())
         .arg("hello world")

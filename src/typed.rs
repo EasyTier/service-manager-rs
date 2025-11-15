@@ -6,7 +6,7 @@ use super::{
 use std::io;
 
 /// Represents an implementation of a known [`ServiceManager`]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TypedServiceManager {
     Launchd(LaunchdServiceManager),
     OpenRc(OpenRcServiceManager),
